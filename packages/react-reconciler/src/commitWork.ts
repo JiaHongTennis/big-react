@@ -1,0 +1,577 @@
+import {
+	Container,
+	Instance,
+	appendChildToContainer,
+	commitUpdate,
+	removeChild,
+	insertChildToContainer,
+	hideInstance,
+	unhideInstance,
+	hideTextInstance,
+	unhideTextInstance
+} from 'hostConfig';
+import { FiberNode, PendingPassiveEffects, fiberRootNode } from './fiber';
+import {
+	ChildDeletion,
+	Flags,
+	LayoutMask,
+	MutationMask,
+	NoFlags,
+	PassiveEffect,
+	Placement,
+	Ref,
+	Update,
+	Visibility
+} from './filberFlags';
+import {
+	FunctionComponent,
+	HostComponent,
+	HostRoot,
+	HostText,
+	OffscreenComponent
+} from './workTags';
+import { Effect, FCUpdateQueue } from './fiberHooks';
+import { HookHasEffect } from './hookEffectTags';
+
+let nextEffect: FiberNode | null = null;
+
+/**
+ * 返回一个函数，该函数就是遍历finishedWork,找出后一个标记有(mask标记的)subtreeFlags的节点然后开始向上遍历整个DOM链表调用callback
+ * @param phrase
+ * @param mask
+ * @param callback
+ * @returns
+ */
+const commitEffects = (
+	phrase: 'mutation' | 'layout',
+	mask: Flags,
+	callback: (fiber: FiberNode, root: fiberRootNode) => void
+) => {
+	return (finishedWork: FiberNode, root: fiberRootNode) => {
+		nextEffect = finishedWork;
+		while (nextEffect !== null) {
+			// 向下遍历
+			const child: FiberNode | null = nextEffect.child;
+
+			// 这里这么做的原因，是找到最下级的需要操作的子节点，从当前子节点开始往上遍历之后再调用commitMutationEffectsOnFiber开始每个操作
+			if ((nextEffect.subtreeFlags & mask) !== NoFlags && child !== null) {
+				// 若存在子节点需要更新的操作则向下继续遍历
+				nextEffect = child;
+			} else {
+				// 证明要找的子节点不包含subtreeFlags
+				// 向上遍历DFS
+				while (nextEffect !== null) {
+					// 这里是处理节点的核心
+					callback(nextEffect, root);
+					// 兄弟节点
+					const sibling: FiberNode | null = nextEffect.sibling;
+
+					if (sibling !== null) {
+						// 如果存在兄弟节点，我们先处理兄弟节点，直到没有再向上找父级
+						nextEffect = sibling;
+						break;
+					}
+					nextEffect = nextEffect.return;
+				}
+			}
+		}
+	};
+};
+
+// commit节点向上递归开始处理标记的方法
+const commitMutationEffectsOnFiber = (finishedWork: FiberNode, root: fiberRootNode) => {
+	const { flags, tag } = finishedWork;
+
+	if ((flags & Placement) !== NoFlags) {
+		// 执行Placement这个是插入或者移动标记
+		// 会将finishedWork插入到父级的上一层，如果父级是HostRoot则直接插入到容器里面
+		commitPlacement(finishedWork);
+		// 去除标记
+		finishedWork.flags &= ~Placement;
+	}
+
+	if ((flags & Update) !== NoFlags) {
+		// 执行Update操作
+		commitUpdate(finishedWork);
+		// 去除标记
+		finishedWork.flags &= ~Update;
+	}
+
+	if ((flags & ChildDeletion) !== NoFlags) {
+		// 删除操作
+		const deletions = finishedWork.deletions;
+		if (deletions !== null) {
+			// deletions是一个数组
+			deletions.forEach((childToDelete) => {
+				commitDeletion(childToDelete, root);
+			});
+		}
+		// 去除标记
+		finishedWork.flags &= ~ChildDeletion;
+	}
+	if ((flags & PassiveEffect) !== NoFlags) {
+		// 收集回调
+		commitPassiveEffect(finishedWork, root, 'update');
+		// 移除标记
+		finishedWork.flags &= ~PassiveEffect;
+	}
+	// 出现Visibilit意味着offscreenFiber的状态发生了变化
+	if ((flags & Visibility) !== NoFlags && tag === OffscreenComponent) {
+		const isHidden = finishedWork.pendingProps.mode === 'hidden';
+		// 找到最顶层的HostComponent根节点，并根据isHidden的状态设置根节点的显示隐藏
+		hideOrUnhideAllChildren(finishedWork, isHidden);
+		finishedWork.flags &= ~Visibility;
+	}
+};
+
+function hideOrUnhideAllChildren(finishedWork: FiberNode, isHidden: boolean) {
+	// findHostSubtreeRoot这个方法是遍历节点并通过钩子，找到最顶层的HostComponent根节点。
+	findHostSubtreeRoot(finishedWork, (HostRoot) => {
+		// 这里就拿到了顶部的Host类型HostText以及的节点,也就是文本节点跟dom节点，分别实现这两个节点的显示因此的dom操作方法
+		// 根据pendingProps.mode中的状态去决定显示以及隐藏
+		const instance = HostRoot.stateNode;
+		if (HostRoot.tag === HostComponent) {
+			isHidden ? hideInstance(instance) : unhideInstance(instance);
+		} else if (HostRoot.tag === HostText) {
+			isHidden
+				? hideTextInstance(instance)
+				: unhideTextInstance(instance, HostRoot.memoizedProps.content);
+		}
+	});
+}
+
+function findHostSubtreeRoot(
+	finishedWork: FiberNode,
+	callback: (hostSubtreeRoot: FiberNode) => void
+) {
+	let node = finishedWork;
+	// 定义一个变量用来保存host节点
+	let hostSubtreeRoot = null;
+
+	while (true) {
+		// 这里是处理遍历逻辑的地方
+		// 判断是不是host类型节点
+		if (node.tag === HostComponent) {
+			if (hostSubtreeRoot === null) {
+				// 如果hostSubtreeRoot === null意味着没有保存过，那么这个就是第一个碰到的host类型的节点，也就是最顶部的节点
+				// 保存起来
+				hostSubtreeRoot = node;
+				// 调用回调
+				callback(node);
+			}
+		} else if (node.tag === HostText) {
+			if (hostSubtreeRoot === null) {
+				// 如果是text节点，同样调用回调但是不保存到hostSubtreeRoot
+				callback(node);
+			}
+		} else if (
+			node.tag === OffscreenComponent &&
+			node.pendingProps.mode === 'hidden' &&
+			node !== finishedWork
+		) {
+			// 进入这个条件的情况有一种可能就是有Suspense里面还有一个Suspense
+			// 这种情况什么都做不做，因此这里就不会进入node.child !== null的判断旧不会继续往下遍历，而会开始判断是否存在兄弟节点
+		} else if (node.child !== null) {
+			// 这里为什么是else if呢?
+			// 因为这里的深度优先遍历目的只是想找到顶部的host根节点，但是这个节点可能是组件的节点，而不是host根节点，所以我们需要一个遍历不断的往下找直到找到第一个之后，这里就不会继续往下找子节点了
+			// 但是上面的情况我们不会使用continue跳出去，所以他会继续判断是否有兄弟节点，如果存在兄弟节点的话又会继续找出兄弟节点的顶部根节点
+			// 这一步是向下遍历子级节点
+			node.child.return = node;
+			node = node.child;
+			// 在这里会跳出while,意味着如果存在子节点就不会走后面的逻辑
+			continue;
+		}
+
+		if (node === finishedWork) {
+			// 退出条件
+			return;
+		}
+
+		// 不存在子节点的情况下，判断是否有兄弟节点
+		while (node.sibling === null) {
+			// 如果没有那么往上找，直到回到原来最开始的节点
+			if (node.return === null || node.return === finishedWork) {
+				// 父节点不存在或者是回到了最开始的地方，这里其实传入的finishedWork就是offscreenFiber
+				// 正常情况下结束的条件都是node.return === finishedWork
+				return;
+			}
+
+			if (hostSubtreeRoot === node) {
+				// 进入这里的情况表示在上面的判断中，进入了node.tag === HostComponent找到了第一个顶部的host节点
+				// 准备离开的时候我们需要将hostSubtreeRoot重置一下
+				hostSubtreeRoot = null;
+			}
+
+			// 如果存在父节点继续往上，这样一来如果父节点存在兄弟节点的话，那么就会跳出当前的while循环
+			node = node.return;
+		}
+
+		if (hostSubtreeRoot === node) {
+			// 这个时候已经离开了顶层的节点
+			hostSubtreeRoot = null;
+		}
+
+		// 到这里意味着当前节点存在兄弟节点就会赋值到兄弟节点，然后下一个循环开始又会判断node.sibling是否存在子节点
+		node.sibling.return = node.return;
+		node = node.sibling;
+	}
+}
+
+// 解绑ref的方法，节点被销毁的时候需要调用到
+function safelyDetachRef(current: FiberNode) {
+	const ref = current.ref;
+	if (ref !== null) {
+		if (typeof ref === 'function') {
+			ref(null);
+		} else {
+			ref.current = null;
+		}
+	}
+}
+
+const commitLayoutEffectsOnFiber = (finishedWork: FiberNode, root: fiberRootNode) => {
+	const { flags, tag } = finishedWork;
+
+	if ((flags & Ref) !== NoFlags && tag === HostComponent) {
+		// 绑定新的ref
+		safelyAttachRef(finishedWork);
+		finishedWork.flags &= ~Ref;
+	}
+};
+
+// 绑定ref的方法，节点的ref属性的值如果有变动的时候再beginWork阶段会被标记上flags,在commit执行完真实节点的更新之后就会到这个方法更新ref
+function safelyAttachRef(fiber: FiberNode) {
+	// 拿到ref属性
+	const ref = fiber.ref;
+	if (ref !== null) {
+		// 如果是element节点那么stateNode保存的就是真实节点
+		const instance = fiber.stateNode;
+		if (typeof ref === 'function') {
+			// 如果是函数类型的话则调用函数将真实节点传递出去
+			ref(instance);
+		} else {
+			// 如果是属性赋值的方式这直接赋值到current上
+			ref.current = instance;
+		}
+	}
+}
+
+export const commitMutationEffects = commitEffects(
+	'mutation',
+	// MutationMask = Placement | Update | ChildDeletion, 合并上PassiveEffect这个是代表useEffect操作
+	MutationMask | PassiveEffect,
+	commitMutationEffectsOnFiber
+);
+
+// LayoutMask就是Ref标记
+export const commitLayoutEffects = commitEffects('layout', LayoutMask, commitLayoutEffectsOnFiber);
+
+/**
+ * 收集effect方法
+ * @param fiber 当前的fiberNode
+ * @param root fiberRootNode
+ * @param type 时机类型
+ * @returns
+ */
+function commitPassiveEffect(
+	fiber: FiberNode,
+	root: fiberRootNode,
+	type: keyof PendingPassiveEffects
+) {
+	// update unmount
+	if (
+		fiber.tag !== FunctionComponent ||
+		(type === 'update' && fiber.flags & PassiveEffect) === NoFlags
+	) {
+		// 不是函数组件,或者是不存在PassiveEffect标记的,都不处理
+		return;
+	}
+	// 拿到当前fiber的updateQueue
+	const updateQueue = fiber.updateQueue as FCUpdateQueue<any>;
+	if (updateQueue !== null) {
+		if (updateQueue.lastEffect === null && __DEV__) {
+			console.error('当FC存在PassiveEffect flag时,不应该不存在Effect');
+		}
+		// 因为effect是一个环状链表并且保存在updateQueue中,updateQueue.lastEffect保存起来，后续再遍历这个环状链表就能拿到所有的effect
+		// 这里因为push操作收集的回调是在commit阶段的，而commit阶段处理标记都是从子节点往上的阶段，这也是为什么useEffect回调都是子节点先触发
+		root.pendingPassiveEffects[type].push(updateQueue.lastEffect as Effect);
+	}
+}
+
+/**
+ * 循环遍历effect环状链表的方法
+ * @param flags
+ * @param lastEffect
+ * @param callback 回调方法，传入当前的effect
+ */
+function commitHookEffectList(
+	flags: Flags,
+	lastEffect: Effect,
+	callback: (effect: Effect) => void
+) {
+	let effect = lastEffect.next as Effect;
+
+	do {
+		// 判断effect.tag是否包含flags的类型
+		if ((effect.tag & flags) === flags) {
+			callback(effect);
+		}
+		effect = effect.next as Effect;
+	} while (effect !== lastEffect.next);
+}
+
+export function commitHookEffectListUnmount(flags: Flags, lastEffect: Effect) {
+	commitHookEffectList(flags, lastEffect, (effect) => {
+		const destroy = effect.destroy;
+		if (typeof destroy === 'function') {
+			destroy();
+		}
+		// 防止触发create,需要移除HookHasEffect
+		effect.tag &= ~HookHasEffect;
+	});
+}
+
+export function commitHookEffectListDestroy(flags: Flags, lastEffect: Effect) {
+	commitHookEffectList(flags, lastEffect, (effect) => {
+		const destroy = effect.destroy;
+		if (typeof destroy === 'function') {
+			destroy();
+		}
+	});
+}
+
+export function commitHookEffectListCreate(flags: Flags, lastEffect: Effect) {
+	commitHookEffectList(flags, lastEffect, (effect) => {
+		const create = effect.create;
+		if (typeof create === 'function') {
+			effect.destroy = create();
+		}
+	});
+}
+
+/**
+ * 当出现<><div>1</div><div>2</div></>这种情况的时候由于Fragment不是一个真实存在的节点所以不能用来执行removeDom的操作
+ * 考虑删除Fragment后，子树的根Host节点可能存在多个
+ * @param childrenToDelete
+ * @param unmountFiber
+ */
+function recordHostChildrenToDelete(childrenToDelete: FiberNode[], unmountFiber: FiberNode) {
+	// 1.找到第一个root host节点
+	const lastOne = childrenToDelete[childrenToDelete.length - 1];
+	if (!lastOne) {
+		childrenToDelete.push(unmountFiber);
+	} else {
+		let node = lastOne.sibling;
+		while (node !== null) {
+			// 2.没找到一个 host 节点，判断下这个节点是不是 1 找到那个节点的兄弟节点
+			// 是否与第一个被收集的节点是兄弟节点，是的话一并添加到childrenToDelete待删除
+			if (unmountFiber === node) {
+				childrenToDelete.push(unmountFiber);
+			}
+			node = node.sibling;
+		}
+	}
+}
+
+function commitDeletion(childToDelete: FiberNode, root: fiberRootNode) {
+	// 当前正在处理的FiberNode的根
+	const rootChildrenToDelete: FiberNode[] = [];
+
+	// 递归子树
+	commitNestedUnmounts(childToDelete, (unmountFiber) => {
+		// 当前方法会递归节点childToDelete下所有的子节点
+		// 当出现 <div>
+		//   <>
+		//      <p>xxx</p>
+		//      <p>yyy</p>
+		//   </>
+		// </div> 的时候由于<></>不是一个真实的节点所以不能添加到rootChildrenToDelete中
+		// Fragment节点在当前switch中不会被处理,所以当childToDelete节点为Fragment的时候第一个被处理的节点是Fragment的非Fragment类型的子节点
+		// 考虑删除Fragment后，子树的根Host节点可能存在多个,我们需要recordHostChildrenToDelete方法来收集第一个节点有可能存在多个节点的可能
+		switch (unmountFiber.tag) {
+			case HostComponent:
+				recordHostChildrenToDelete(rootChildrenToDelete, unmountFiber);
+				// 节点要被删除因此需要解绑ref，也就是将useRef的{current: 属性变为null}
+				safelyDetachRef(unmountFiber);
+				return;
+			case HostText:
+				recordHostChildrenToDelete(rootChildrenToDelete, unmountFiber);
+				return;
+			case FunctionComponent:
+				// useEffect unmount的处理
+				commitPassiveEffect(unmountFiber, root, 'unmount');
+				return;
+		}
+	});
+
+	// 移除rootHostComponent的DOM
+	if (rootChildrenToDelete.length) {
+		const hostParent = getHostParent(childToDelete);
+		if (hostParent !== null) {
+			rootChildrenToDelete.forEach((node) => {
+				removeChild(node.stateNode, hostParent);
+			});
+		}
+	}
+	childToDelete.return = null;
+	childToDelete.child = null;
+}
+
+/**
+ * 递归子树的方法
+ * @param root 接收一个递归子树的根节点
+ * @param onCommitUnmount 接收到的当前点递归的回调函数
+ */
+function commitNestedUnmounts(root: FiberNode, onCommitUnmount: (fiber: FiberNode) => void) {
+	let node = root;
+	while (true) {
+		onCommitUnmount(node);
+		if (node.child !== null) {
+			// 向下遍历
+			node.child.return = node;
+			node = node.child;
+			continue;
+		}
+
+		if (node === root) {
+			// 终止条件
+			return;
+		}
+		while (node.sibling === null) {
+			if (node.return === null || node.return === root) {
+				return;
+			}
+			// 向上归
+			node = node.return;
+		}
+		// 存在兄弟节点
+		node.sibling.return = node.return;
+		node = node.sibling;
+	}
+}
+
+// 这里是处理Placement标记的函数
+const commitPlacement = (finishedWork: FiberNode) => {
+	if (__DEV__) {
+		console.log('执行Placement操作', finishedWork);
+	}
+	// parent DOM
+	// 这里是拿到当前的fiberNode的父节点的宿主环境Container
+	const hostParent = getHostParent(finishedWork);
+
+	// 找出当前节点的下一个没有添加Placement的兄弟节点，如果是最后一个就返回null
+	const sibling = getHostSibling(finishedWork);
+	// 接下来找到finishedWork对应的DOM并且将DOM append 到 parentDOM中
+	if (hostParent !== null) {
+		// 如果sibling为null调用appendChild插入到最后，如果不为null则插入到sibling之前
+		insertOrAppendPlacementNodeIntoContainer(finishedWork, hostParent, sibling);
+	}
+};
+
+function getHostSibling(fiber: FiberNode) {
+	let node: FiberNode = fiber;
+
+	findSibling: while (true) {
+		// 这里是考虑到当前节点为组件的根节点的时候我们的相邻节点其实是组件的节点，所以要通过return取到上一级组件节点的相邻节点
+		// <Component><div>当前为组件根节点相邻节点是当前fiberNode.return.siblint</div></Component><div></div>
+		while (node.sibling === null) {
+			// 当前节点若不存在兄弟节点则往上获取父级
+			const parent = node.return;
+
+			// 判断是否是组件
+			if (parent === null || parent.tag === HostComponent || parent.tag === HostRoot) {
+				return null;
+			}
+			// 如果是组件继续往上找
+			node = parent;
+		}
+
+		// 如果下一级兄弟节点存在，改变兄弟节点的父级指向,并将当前指正指向兄弟节点
+		node.sibling.return = node.return;
+		node = node.sibling;
+
+		// 这里处理兄弟节点是组件的情况，如果是组件我们应该插入到组件的根节点
+		// <div></div><Component><div>我是兄弟节点的组件插入到我的前面</div></Component>
+		while (node.tag !== HostText && node.tag !== HostComponent) {
+			// 向下遍历
+			if ((node.flags & Placement) !== NoFlags) {
+				// 判断下组件的根节点时候是不移动类型，如果同样是有Placement标记的花我们应该跳出当前循环继续往下寻找
+				continue findSibling;
+			}
+			// 如果组件类型为null同样跳出
+			if (node.child === null) {
+				continue findSibling;
+			} else {
+				// 如果存在并且不为移动类型，则将指针指向当前节点继续再while循环中判断
+				node.child.return = node;
+				node = node.child;
+				// 这里为何不直接跳出是还有组件内继续还是组件的可能性
+			}
+		}
+
+		// 这里找到下一个最近的不移动的节点
+		// 13245 -> 21354
+		// 那么需要移动的就是134
+		// 1的下一个不移动节点是5，插入到5的前面变成32415
+		// 3的下一个不移动节点是5，插入到前面变成24135  -----> 这里由于1跟3前面都是5所以先执行移动的必定再后执行移动的左边，因此符合新节点的顺序
+		// 4的不存在下一个不移动节点，插入最后21354
+		if ((node.flags & Placement) === NoFlags) {
+			return node.stateNode;
+		}
+		// 如果当前节点是也是被打上Placement标记结束当前循环继续往下
+	}
+}
+
+// 获得父级的宿主环境的节点
+function getHostParent(fiber: FiberNode): Container | null {
+	// 执行一个向上遍历的过程
+	let parent = fiber.return;
+
+	while (parent) {
+		const parentTag = parent.tag;
+		// 那种环境下parentTag才对呀的是宿主环境下的父级节点呢
+		// HostComponent HostRoot
+		if (parentTag === HostComponent) {
+			return parent.stateNode;
+		}
+		if (parentTag === HostRoot) {
+			return (parent.stateNode as fiberRootNode).container;
+		}
+		parent = parent.return;
+		if (__DEV__) {
+			console.warn('未找到host: parent');
+		}
+	}
+
+	return null;
+}
+
+function insertOrAppendPlacementNodeIntoContainer(
+	finishedWork: FiberNode,
+	hostParent: Container,
+	before: Instance
+) {
+	// 向下遍历
+	if (finishedWork.tag === HostComponent || finishedWork.tag === HostText) {
+		// 这里是将FiberNode的stateNode给插入到父级的DOM中，其实部分元素在completeWork已经插入,目前的话这里只有HostRoot的时候才会在HostRoot.child上面添加上插入标记
+		// 只有在最后的当finishedWork = HostRootFiber的时候此时容器hostParent拿到的是挂载的节点#root这个时候就会挂载到界面上
+		if (before) {
+			insertChildToContainer(finishedWork.stateNode, hostParent, before);
+		} else {
+			appendChildToContainer(hostParent, finishedWork.stateNode);
+		}
+		return;
+	}
+	// 到这里为组件类型，组件类型本身是不存在stateNode的所以我们需要取当前的FiberNode.child
+	const child = finishedWork.child;
+	if (child !== null) {
+		insertOrAppendPlacementNodeIntoContainer(child, hostParent, before);
+		let sibling = child.sibling;
+
+		// 组件内有可能是多个根节点
+		while (sibling !== null) {
+			insertOrAppendPlacementNodeIntoContainer(sibling, hostParent, before);
+			sibling = sibling.sibling;
+		}
+	}
+}
